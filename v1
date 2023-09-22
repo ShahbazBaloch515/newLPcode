@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract Exchange16 is ReentrancyGuard, Ownable {
+    IERC20 public token; // Main token
+    IERC20 public VSMUToken; // VSMU token
+
+    uint256 public feePercentage = 20; // 0.20% fee
+    bool public paused;
+    uint256 public constant TRANSACTION_PERCENTAGE_LIMIT = 5; 
+
+    mapping(address => bool) public excludedFromFee;
+    mapping(address => uint256) public tokenBalances;
+    mapping(address => bool) public supportedTokens;
+
+    event Buy(address indexed buyer, uint256 tokensBought, uint256 tokensSpent, address spendingToken);
+    event Sell(address indexed seller, uint256 tokensSold, uint256 tokensReceived, address receivingToken);
+    event TokenAdded(address indexed token);
+    event TokenRemoved(address indexed token);
+    event FeeChanged(uint256 newFeePercentage);
+
+    modifier onlyAdmin() {
+        require(msg.sender == owner(), "Only admin can perform this action");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!paused, "Contract is paused");
+        _;
+    }
+
+    constructor(address _mainTokenAddress, address _VSMUTokenAddress) {
+        token = IERC20(_mainTokenAddress);
+        VSMUToken = IERC20(_VSMUTokenAddress);
+    }
+
+    function mainTokenBalance() private view returns (uint256) {
+        return token.balanceOf(address(this));
+    }
+
+    function getRequiredDepositAmounts(uint256 mainTokenAmount) public view returns (address[] memory tokens, uint256[] memory amounts) {
+        address[] memory supportedTokenAddresses = new address[](supportedTokens.length);
+        uint256[] memory requiredAmounts = new uint256[](supportedTokens.length);
+        
+        uint i = 0;
+        for (address tokenAddress in supportedTokens) {
+            supportedTokenAddresses[i] = tokenAddress;
+            uint256 ratio = token.balanceOf(address(this)) / IERC20(tokenAddress).balanceOf(address(this));
+            requiredAmounts[i] = mainTokenAmount * ratio;
+            i++;
+        }
+        
+        return (supportedTokenAddresses, requiredAmounts);
+    }
+
+    function addLiquidity(uint256 mainTokenAmount) external {
+        require(token.transferFrom(msg.sender, address(this), mainTokenAmount), "Main token transfer failed");
+        (, uint256[] memory requiredAmounts) = getRequiredDepositAmounts(mainTokenAmount);
+        for (uint i = 0; i < supportedTokens.length; i++) {
+            address tokenAddress = supportedTokens[i];
+            require(IERC20(tokenAddress).transferFrom(msg.sender, address(this), requiredAmounts[i]), "Token transfer failed");
+        }
+        
+        VSMUToken.transfer(msg.sender, mainTokenAmount);  // 1 VSMU for each main token as per your example
+    }
+
+    function removeLiquidity(uint256 VSMUAmount) external {
+        require(VSMUToken.transferFrom(msg.sender, address(this), VSMUAmount), "VSMU token transfer failed");
+        
+        uint256 mainTokenAmount = VSMUAmount;  // 1 VSMU = 1 main token as per your example
+        require(token.transfer(msg.sender, mainTokenAmount), "Main token transfer failed");
+
+        (, uint256[] memory requiredAmounts) = getRequiredDepositAmounts(VSMUAmount);
+        for (uint i = 0; i < supportedTokens.length; i++) {
+            address tokenAddress = supportedTokens[i];
+            require(IERC20(tokenAddress).transfer(msg.sender, requiredAmounts[i]), "Token transfer failed");
+        }
+    }
+
+    function buy(uint256 tokenAmount, address spendingToken) external whenNotPaused nonReentrant {
+        require(supportedTokens[spendingToken], "Token not supported for trade");
+        uint256 maxBuyableAmount = (IERC20(spendingToken).balanceOf(address(this)) * TRANSACTION_PERCENTAGE_LIMIT) / 100;
+        require(tokenAmount <= maxBuyableAmount, "Buy amount exceeds 5% of contract's spending token balance");
+
+        uint256 totalTokensInContract = IERC20(spendingToken).balanceOf(address(this));
+        uint256 price = getPrice(totalTokensInContract, mainTokenBalance());
+        uint256 mainTokensToBuyBeforeFee = (tokenAmount * 1e18) / price;
+        uint256 feeForOwner = (mainTokensToBuyBeforeFee * feePercentage) / 10000;
+        uint256 mainTokensToBuy = mainTokensToBuyBeforeFee - feeForOwner;
+
+        require(IERC20(spendingToken).transferFrom(msg.sender, address(this), tokenAmount), "Token transfer failed");
+        tokenBalances[spendingToken] += tokenAmount;
+
+        require(token.transfer(owner(), feeForOwner), "Fee transfer failed");
+        require(token.transfer(msg.sender, mainTokensToBuy), "Token transfer failed");
+
+        emit Buy(msg.sender, mainTokensToBuy, tokenAmount, spendingToken);
+    }
+
+    function sell(uint256 tokensToSell, address receivingToken) external whenNotPaused nonReentrant {
+        require(supportedTokens[receivingToken], "Token not supported for trade");
+        uint256 maxSellableAmount = (mainTokenBalance() * TRANSACTION_PERCENTAGE_LIMIT) / 100;
+        require(tokensToSell <= maxSellableAmount, "Sell amount exceeds 5% of contract's main token balance");
+
+        uint256 totalTokensInContract = IERC20(receivingToken).balanceOf(address(this));
+        uint256 price = getPrice(totalTokensInContract, mainTokenBalance());
+        uint256 tokensToReceive = (tokensToSell * price) / 1e18;
+        uint256 feeForOwner = (tokensToReceive * feePercentage) / 10000;
+
+        require(token.transferFrom(msg.sender, address(this), tokensToSell), "Transfer failed");
+
+        IERC20(receivingToken).transfer(owner(), feeForOwner);
+        tokenBalances[receivingToken] -= (tokensToReceive - feeForOwner);
+        IERC20(receivingToken).transfer(msg.sender, tokensToReceive - feeForOwner);
+
+        emit Sell(msg.sender, tokensToSell, tokensToReceive - feeForOwner, receivingToken);
+    }
+
+    function getPrice(uint256 totalTokensInContract, uint256 _mainTokenBalance) public pure returns (uint256) {
+        return (totalTokensInContract * 1e18) / _mainTokenBalance;
+    }
+
+    function depositToken(address _token, uint256 _amount) external {
+        IERC20(_token).transferFrom(msg.sender, address(this), _amount);
+        tokenBalances[_token] += _amount;
+    }
+
+    function getPriceForAPI(address _token) public view returns (uint256) {
+        uint256 totalTokensInContract = IERC20(_token).balanceOf(address(this));
+        return (1e18 * mainTokenBalance()) / totalTokensInContract;
+    }
+
+    function getBuyAmountAfterFee(uint256 tokenAmount, address spendingToken) public view returns (uint256) {
+        uint256 totalTokensInContract = IERC20(spendingToken).balanceOf(address(this));
+        uint256 price = getPrice(totalTokensInContract, mainTokenBalance());
+        uint256 mainTokensToBuyBeforeFee = (tokenAmount * 1e18) / price;
+        uint256 feeForOwner = (mainTokensToBuyBeforeFee * feePercentage) / 10000;
+        uint256 mainTokensToBuy = mainTokensToBuyBeforeFee - feeForOwner;
+        return mainTokensToBuy;
+    }
+
+    function getSellAmountAfterFee(uint256 tokensToSell, address receivingToken) public view returns (uint256) {
+        uint256 totalTokensInContract = IERC20(receivingToken).balanceOf(address(this));
+        uint256 price = getPrice(totalTokensInContract, mainTokenBalance());
+        uint256 tokensToReceive = (tokensToSell * price) / 1e18;
+        uint256 feeForOwner = (tokensToReceive * feePercentage) / 10000;
+        uint256 tokensReceived = tokensToReceive - feeForOwner;
+        return tokensReceived;
+    }
+
+    function adminWithdrawERC(address _token, uint256 _amount) external onlyAdmin {
+        IERC20(_token).transfer(owner(), _amount);
+    }
+
+    function adminWithdrawEther(uint256 _amount) external onlyAdmin {
+        payable(owner()).transfer(_amount);
+    }
+
+    function addSupportedToken(address _token) external onlyAdmin {
+        tokenBalances[_token] = IERC20(_token).balanceOf(address(this));
+        supportedTokens[_token] = true;
+        emit TokenAdded(_token);
+    }
+
+    function removeSupportedToken(address _token) external onlyAdmin {
+        require(supportedTokens[_token], "Token not supported");
+        delete tokenBalances[_token];
+        supportedTokens[_token] = false;
+        emit TokenRemoved(_token);
+    }
+
+    function setPaused(bool _paused) external onlyAdmin {
+        paused = _paused;
+    }
+
+    function changeFeePercentage(uint256 newFee) external onlyAdmin {
+        feePercentage = newFee;
+        emit FeeChanged(newFee);
+    }
+
+    function setExcludedFromFee(address user, bool excluded) external onlyAdmin {
+        excludedFromFee[user] = excluded;
+    }
+}
