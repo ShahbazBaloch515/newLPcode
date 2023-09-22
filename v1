@@ -6,9 +6,8 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract Exchange16 is ReentrancyGuard, Ownable {
-    IERC20 public token; // Main token
-    IERC20 public VSMUToken; // VSMU token
-
+    address public tokenAddress;
+    IERC20 public token;
     uint256 public feePercentage = 20; // 0.20% fee
     bool public paused;
     uint256 public constant TRANSACTION_PERCENTAGE_LIMIT = 5; 
@@ -16,12 +15,18 @@ contract Exchange16 is ReentrancyGuard, Ownable {
     mapping(address => bool) public excludedFromFee;
     mapping(address => uint256) public tokenBalances;
     mapping(address => bool) public supportedTokens;
+    address[] public supportedTokenList;
 
     event Buy(address indexed buyer, uint256 tokensBought, uint256 tokensSpent, address spendingToken);
     event Sell(address indexed seller, uint256 tokensSold, uint256 tokensReceived, address receivingToken);
     event TokenAdded(address indexed token);
     event TokenRemoved(address indexed token);
     event FeeChanged(uint256 newFeePercentage);
+
+    constructor(address _mainTokenAddress) {
+        tokenAddress = _mainTokenAddress;
+        token = IERC20(_mainTokenAddress);
+    }
 
     modifier onlyAdmin() {
         require(msg.sender == owner(), "Only admin can perform this action");
@@ -33,53 +38,67 @@ contract Exchange16 is ReentrancyGuard, Ownable {
         _;
     }
 
-    constructor(address _mainTokenAddress, address _VSMUTokenAddress) {
-        token = IERC20(_mainTokenAddress);
-        VSMUToken = IERC20(_VSMUTokenAddress);
-    }
-
     function mainTokenBalance() private view returns (uint256) {
         return token.balanceOf(address(this));
     }
 
-    function getRequiredDepositAmounts(uint256 mainTokenAmount) public view returns (address[] memory tokens, uint256[] memory amounts) {
-        address[] memory supportedTokenAddresses = new address[](supportedTokens.length);
-        uint256[] memory requiredAmounts = new uint256[](supportedTokens.length);
+    function adminWithdrawToken(address _token, uint256 _amount) external onlyAdmin {
+        require(tokenBalances[_token] >= _amount, "Insufficient balance");
+        tokenBalances[_token] -= _amount;
+        IERC20(_token).transfer(owner(), _amount);
+    }
+
+    function changeFeePercentage(uint256 newFee) external onlyAdmin {
+        feePercentage = newFee;
+        emit FeeChanged(newFee);
+    }
+
+    function setExcludedFromFee(address user, bool excluded) external onlyAdmin {
+        excludedFromFee[user] = excluded;
+    }
+
+    function setPaused(bool _paused) external onlyAdmin {
+        paused = _paused;
+    }
+
+    function addSupportedToken(address _token) external onlyAdmin {
+        supportedTokens[_token] = true;
+        supportedTokenList.push(_token);
+        emit TokenAdded(_token);
+    }
+
+    function removeSupportedToken(address _token) external onlyAdmin {
+        require(supportedTokens[_token], "Token not supported");
+        supportedTokens[_token] = false;
+        for (uint i = 0; i < supportedTokenList.length; i++) {
+            if (supportedTokenList[i] == _token) {
+                supportedTokenList[i] = supportedTokenList[supportedTokenList.length - 1];
+                supportedTokenList.pop();
+                break;
+            }
+        }
+        emit TokenRemoved(_token);
+    }
+
+   function getRequiredDepositAmounts(uint256 mainTokenAmount) public view returns (address[] memory tokens, uint256[] memory amounts) {
+    address[] memory supportedTokenAddresses = new address[](supportedTokenList.length);
+    uint256[] memory requiredAmounts = new uint256[](supportedTokenList.length);
+
+    for (uint i = 0; i < supportedTokenList.length; i++) {
+        address currentTokenAddress = supportedTokenList[i];
+        supportedTokenAddresses[i] = currentTokenAddress;
         
-        uint i = 0;
-        for (address tokenAddress in supportedTokens) {
-            supportedTokenAddresses[i] = tokenAddress;
-            uint256 ratio = token.balanceOf(address(this)) / IERC20(tokenAddress).balanceOf(address(this));
+        uint256 supportedTokenBalance = IERC20(currentTokenAddress).balanceOf(address(this));
+        if (supportedTokenBalance == 0) {
+            requiredAmounts[i] = 0; 
+        } else {
+            uint256 ratio = mainTokenAmount / supportedTokenBalance;
             requiredAmounts[i] = mainTokenAmount * ratio;
-            i++;
-        }
-        
-        return (supportedTokenAddresses, requiredAmounts);
-    }
-
-    function addLiquidity(uint256 mainTokenAmount) external {
-        require(token.transferFrom(msg.sender, address(this), mainTokenAmount), "Main token transfer failed");
-        (, uint256[] memory requiredAmounts) = getRequiredDepositAmounts(mainTokenAmount);
-        for (uint i = 0; i < supportedTokens.length; i++) {
-            address tokenAddress = supportedTokens[i];
-            require(IERC20(tokenAddress).transferFrom(msg.sender, address(this), requiredAmounts[i]), "Token transfer failed");
-        }
-        
-        VSMUToken.transfer(msg.sender, mainTokenAmount);  // 1 VSMU for each main token as per your example
-    }
-
-    function removeLiquidity(uint256 VSMUAmount) external {
-        require(VSMUToken.transferFrom(msg.sender, address(this), VSMUAmount), "VSMU token transfer failed");
-        
-        uint256 mainTokenAmount = VSMUAmount;  // 1 VSMU = 1 main token as per your example
-        require(token.transfer(msg.sender, mainTokenAmount), "Main token transfer failed");
-
-        (, uint256[] memory requiredAmounts) = getRequiredDepositAmounts(VSMUAmount);
-        for (uint i = 0; i < supportedTokens.length; i++) {
-            address tokenAddress = supportedTokens[i];
-            require(IERC20(tokenAddress).transfer(msg.sender, requiredAmounts[i]), "Token transfer failed");
         }
     }
+
+    return (supportedTokenAddresses, requiredAmounts);
+}
 
     function buy(uint256 tokenAmount, address spendingToken) external whenNotPaused nonReentrant {
         require(supportedTokens[spendingToken], "Token not supported for trade");
@@ -158,31 +177,5 @@ contract Exchange16 is ReentrancyGuard, Ownable {
 
     function adminWithdrawEther(uint256 _amount) external onlyAdmin {
         payable(owner()).transfer(_amount);
-    }
-
-    function addSupportedToken(address _token) external onlyAdmin {
-        tokenBalances[_token] = IERC20(_token).balanceOf(address(this));
-        supportedTokens[_token] = true;
-        emit TokenAdded(_token);
-    }
-
-    function removeSupportedToken(address _token) external onlyAdmin {
-        require(supportedTokens[_token], "Token not supported");
-        delete tokenBalances[_token];
-        supportedTokens[_token] = false;
-        emit TokenRemoved(_token);
-    }
-
-    function setPaused(bool _paused) external onlyAdmin {
-        paused = _paused;
-    }
-
-    function changeFeePercentage(uint256 newFee) external onlyAdmin {
-        feePercentage = newFee;
-        emit FeeChanged(newFee);
-    }
-
-    function setExcludedFromFee(address user, bool excluded) external onlyAdmin {
-        excludedFromFee[user] = excluded;
     }
 }
